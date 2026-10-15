@@ -1,0 +1,5 @@
+build/
+logs/
+.env
+*.o
+*.zip
