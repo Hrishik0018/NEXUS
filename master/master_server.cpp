@@ -19,7 +19,8 @@ bool quietHeartbeat() {
     return q;
 }
 }  // namespace
-
+// Starts the TCP listener and launches separate threads for accepting
+// worker connections and monitoring worker heartbeat timeouts.
 bool MasterServer::start(std::string& err) {
     listenFd_ = createListener(port_, err);
     if (listenFd_ < 0) return false;
@@ -28,7 +29,8 @@ bool MasterServer::start(std::string& err) {
     monitorThread_ = std::thread(&MasterServer::monitorLoop, this);
     return true;
 }
-
+// Stops the server, disconnects workers, joins background threads,
+// and closes the listening socket.
 void MasterServer::stop() {
     if (!running_.exchange(false)) return;
     workers_.disconnectAll();                 // wake every blocked reader thread
