@@ -1,6 +1,5 @@
-// Message framing + TCP connection wrapper shared by Master and Worker.
-#pragma once
 
+#pragma once
 #include <map>
 #include <memory>
 #include <mutex>
