@@ -2,19 +2,14 @@
 
 #include <sys/statvfs.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
-
 namespace nexus {
-
 namespace {
-
-// Reads "Key:   12345 kB" lines from /proc/meminfo; returns kB or -1.
 long long meminfoKb(const std::string& wanted) {
     std::ifstream f("/proc/meminfo");
     std::string key;
@@ -34,7 +29,6 @@ ResourceMonitor::CpuTimes ResourceMonitor::readCpuTimes() {
     std::ifstream f("/proc/stat");
     std::string label;
     if (!(f >> label) || label != "cpu") return t;
-    // user nice system idle iowait irq softirq steal ...
     unsigned long long v[8] = {0};
     for (int i = 0; i < 8 && (f >> v[i]); ++i) {}
     const unsigned long long idle = v[3] + v[4];     // idle + iowait

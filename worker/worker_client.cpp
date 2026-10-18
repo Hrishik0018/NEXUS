@@ -1,26 +1,18 @@
 #include "worker_client.h"
-
 #include <unistd.h>
-
 #include <chrono>
 #include <cstdio>
-
 #include "../common/log.h"
 #include "../common/protocol.h"
 #include "task_executor.h"
-
 namespace nexus {
-
 void WorkerClient::stop() {
     running_ = false;
     wake_.notify_all();
     if (conn_) conn_->shutdown();
 }
-
 bool WorkerClient::connectAndRegister() {
     log(tag(), "Connecting to Master at " + cfg_.masterHost + ":" + std::to_string(cfg_.masterPort) + "...");
-
-    // The Master may not be up yet: retry for a while instead of failing at once.
     std::string err;
     for (int attempt = 1; attempt <= 10 && running_; ++attempt) {
         conn_ = Connection::connectTo(cfg_.masterHost, cfg_.masterPort, err);
