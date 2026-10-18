@@ -1,16 +1,10 @@
-// NEXUS application-level protocol constants.
-//
-// TCP only moves bytes. On top of it NEXUS speaks a tiny line-based text
-// protocol: one message per line, "TYPE|key=value|key=value\n".
-// (See message.h for the encoder/decoder.)
+
 #pragma once
-
 #include <string>
-
 namespace nexus {
 namespace proto {
 
-// ---- Message types -------------------------------------------------------
+
 // Worker -> Master
 constexpr const char* REGISTER_WORKER = "REGISTER_WORKER";
 constexpr const char* HEARTBEAT       = "HEARTBEAT";

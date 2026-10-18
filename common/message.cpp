@@ -13,14 +13,14 @@
 #include <unistd.h>
 
 #ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0   // main() also ignores SIGPIPE
+#define MSG_NOSIGNAL 0   
 #endif
 
 namespace nexus {
 
 namespace {
 
-constexpr size_t kMaxLine = 64 * 1024;   // protects against a runaway peer
+constexpr size_t kMaxLine = 64 *1024; 
 
 std::string escape(const std::string& s) {
     std::string out;
@@ -49,9 +49,7 @@ std::string unescape(const std::string& s) {
     return out;
 }
 
-}  // namespace
-
-// ---------------------------------------------------------------- Message --
+}  
 
 Message& Message::set(const std::string& k, const std::string& v) {
     fields_[k] = v;
@@ -140,8 +138,6 @@ bool Connection::send(const Message& m) {
 
 int Connection::receive(Message& out, int timeoutMs) {
     for (;;) {
-        // TCP is a byte stream: one recv() may hold half a message or several.
-        // So we buffer and cut complete lines.
         size_t nl = rbuf_.find('\n');
         if (nl != std::string::npos) {
             std::string line = rbuf_.substr(0, nl);
@@ -177,8 +173,7 @@ std::string Connection::peerAddress() const {
     return buf;
 }
 
-std::shared_ptr<Connection> Connection::connectTo(const std::string& host, int port,
-                                                  std::string& err) {
+std::shared_ptr<Connection> Connection::connectTo(const std::string& host, int port,std::string& err) {
     addrinfo hints;
     std::memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
