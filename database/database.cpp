@@ -2,10 +2,16 @@
 
 #include <libpq-fe.h>
 
+#include <cstdlib>
+#include <cstring>
+
 #include "../common/config.h"
+#include "../common/json.h"
 #include "../common/log.h"
 
 namespace nexus {
+
+const char* const kSqlNull = "\x01NULL";
 
 namespace {
 
@@ -21,11 +27,55 @@ std::string quoteConnValue(const std::string& v) {
 
 std::string num(double v) {
     char buf[64];
-    std::snprintf(buf, sizeof buf, "%.4f", v);
+    std::snprintf(buf, sizeof buf, "%.6f", v);
     return buf;
 }
 
+bool isNumericOid(unsigned t) {
+    return t == 20 || t == 21 || t == 23 || t == 700 || t == 701 || t == 1700;
+}
+
 }  // namespace
+
+// ------------------------------------------------------------------ Result --
+
+long long Database::Result::i(size_t r, size_t c, long long def) const {
+    if (r >= rows.size() || c >= rows[r].size() || nulls[r][c]) return def;
+    try { return std::stoll(rows[r][c]); } catch (...) { return def; }
+}
+double Database::Result::d(size_t r, size_t c, double def) const {
+    if (r >= rows.size() || c >= rows[r].size() || nulls[r][c]) return def;
+    try { return std::stod(rows[r][c]); } catch (...) { return def; }
+}
+
+std::string Database::Result::rowJson(size_t r) const {
+    if (r >= rows.size()) return "null";
+    json::Obj o;
+    for (size_t c = 0; c < columns.size(); ++c) {
+        if (nulls[r][c]) { o.raw(columns[c], "null"); continue; }
+        const std::string& v = rows[r][c];
+        if (types[c] == 16) o.raw(columns[c], json::boolean(v == "t"));
+        else if (isNumericOid(types[c])) {
+            // NaN / Infinity are valid PostgreSQL numerics but not valid JSON.
+            char* end = nullptr;
+            double dv = std::strtod(v.c_str(), &end);
+            if (end && *end == '\0' && std::isfinite(dv)) o.raw(columns[c], v);
+            else o.raw(columns[c], "null");
+        } else o.raw(columns[c], json::str(v));
+    }
+    return o.build();
+}
+
+std::string Database::Result::toJson() const {
+    std::string out = "[";
+    for (size_t r = 0; r < rows.size(); ++r) {
+        if (r) out += ",";
+        out += rowJson(r);
+    }
+    return out + "]";
+}
+
+// ---------------------------------------------------------------- Database --
 
 Database::Config Database::Config::fromEnv() {
     Config c;
@@ -46,6 +96,11 @@ bool Database::connect(std::string& err) {
     return ensureConnected(err);
 }
 
+bool Database::connected() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return conn_ && PQstatus(conn_) == CONNECTION_OK;
+}
+
 bool Database::ensureConnected(std::string& err) {
     if (conn_ && PQstatus(conn_) == CONNECTION_OK) return true;
 
@@ -62,18 +117,18 @@ bool Database::ensureConnected(std::string& err) {
     }
     if (!conn_ || PQstatus(conn_) != CONNECTION_OK) {
         err = conn_ ? PQerrorMessage(conn_) : "PQconnectdb returned null";
+        while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) err.pop_back();
         return false;
     }
     return true;
 }
 
-Database::Result Database::exec(const std::string& sql, const std::vector<std::string>& params) {
+Database::Result Database::execLocked(const std::string& sql, const std::vector<std::string>& params) {
     Result r;
-    std::lock_guard<std::mutex> lock(mutex_);
     if (!ensureConnected(r.error)) return r;
 
     std::vector<const char*> values;
-    for (const auto& p : params) values.push_back(p.c_str());
+    for (const auto& p : params) values.push_back(p == kSqlNull ? nullptr : p.c_str());
 
     PGresult* res = PQexecParams(conn_, sql.c_str(), static_cast<int>(values.size()),
                                  nullptr, values.empty() ? nullptr : values.data(),
@@ -81,120 +136,127 @@ Database::Result Database::exec(const std::string& sql, const std::vector<std::s
     ExecStatusType st = PQresultStatus(res);
     if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
         r.error = PQerrorMessage(conn_);
+        while (!r.error.empty() && (r.error.back() == '\n' || r.error.back() == '\r')) r.error.pop_back();
         log("DB", "Query failed: " + r.error);
         PQclear(res);
         return r;
     }
+    const char* aff = PQcmdTuples(res);
+    r.affected = (aff && *aff) ? std::atoi(aff) : 0;
     int nf = PQnfields(res), nr = PQntuples(res);
-    for (int c = 0; c < nf; ++c) r.columns.push_back(PQfname(res, c));
+    for (int c = 0; c < nf; ++c) {
+        r.columns.push_back(PQfname(res, c));
+        r.types.push_back(PQftype(res, c));
+    }
     for (int i = 0; i < nr; ++i) {
         std::vector<std::string> row;
-        for (int c = 0; c < nf; ++c) row.push_back(PQgetisnull(res, i, c) ? "" : PQgetvalue(res, i, c));
+        std::vector<char> nl;
+        for (int c = 0; c < nf; ++c) {
+            bool isnull = PQgetisnull(res, i, c) != 0;
+            nl.push_back(isnull ? 1 : 0);
+            row.push_back(isnull ? "" : PQgetvalue(res, i, c));
+        }
         r.rows.push_back(std::move(row));
+        r.nulls.push_back(std::move(nl));
     }
     PQclear(res);
     r.ok = true;
     return r;
 }
 
+Database::Result Database::exec(const std::string& sql, const std::vector<std::string>& params) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return execLocked(sql, params);
+}
+
+bool Database::transact(const std::vector<Stmt>& stmts, std::string& err) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Result b = execLocked("BEGIN", {});
+    if (!b.ok) { err = b.error; return false; }
+    for (const auto& s : stmts) {
+        Result r = execLocked(s.sql, s.params);
+        if (!r.ok) {
+            err = r.error;
+            execLocked("ROLLBACK", {});
+            return false;
+        }
+    }
+    Result c = execLocked("COMMIT", {});
+    if (!c.ok) { err = c.error; return false; }
+    return true;
+}
+
+bool Database::runScript(const std::string& sql, std::string& err) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!ensureConnected(err)) return false;
+    PGresult* res = PQexec(conn_, sql.c_str());   // simple-query protocol: multi-statement OK
+    ExecStatusType st = PQresultStatus(res);
+    bool ok = st == PGRES_COMMAND_OK || st == PGRES_TUPLES_OK;
+    if (!ok) err = PQerrorMessage(conn_);
+    PQclear(res);
+    // drain any remaining results of the multi-statement string
+    while ((res = PQgetResult(conn_)) != nullptr) PQclear(res);
+    return ok;
+}
+
+bool Database::schemaPresent(std::string& missing) {
+    static const char* required[] = {
+        "workers", "jobs", "tasks", "resource_metrics", "execution_history", "scheduler_config",
+        "scheduling_decisions", "datasets", "blocks", "block_replicas", "job_stages",
+        "mr_intermediate", "mr_reduce_outputs", "mr_results", "ml_training_runs", "ml_predictions",
+        "benchmark_runs", "benchmark_results"};
+    for (const char* t : required) {
+        Result r = exec("SELECT to_regclass($1) IS NOT NULL", {std::string("public.") + t});
+        if (!r.ok || r.empty() || r.at(0, 0) != "t") { missing = t; return false; }
+    }
+    return true;
+}
+
 // ------------------------------------------------------------- Workers ----
 
 bool Database::markAllWorkersInactive() {
     // On Master start no Worker is connected yet; clear stale ACTIVE flags.
-    return exec("UPDATE workers SET status='INACTIVE'").ok;
+    return exec("UPDATE workers SET status='INACTIVE', running_tasks=0").ok;
 }
 
 bool Database::upsertWorker(const std::string& id, const std::string& hostname,
-                            const std::string& ip, int cpuCores, long long memMb) {
+                            const std::string& ip, int cpuCores, long long memMb, int capacity) {
     return exec(
-        "INSERT INTO workers (worker_id, hostname, ip_address, cpu_cores, memory_total_mb, "
+        "INSERT INTO workers (worker_id, hostname, ip_address, cpu_cores, memory_total_mb, capacity, "
         "                     status, last_heartbeat) "
-        "VALUES ($1, $2, $3, $4::int, $5::bigint, 'ACTIVE', now()) "
+        "VALUES ($1, $2, $3, $4::int, $5::bigint, $6::int, 'ACTIVE', now()) "
         "ON CONFLICT (worker_id) DO UPDATE SET "
         "  hostname=EXCLUDED.hostname, ip_address=EXCLUDED.ip_address, "
         "  cpu_cores=EXCLUDED.cpu_cores, memory_total_mb=EXCLUDED.memory_total_mb, "
-        "  status='ACTIVE', last_heartbeat=now()",
-        {id, hostname, ip, std::to_string(cpuCores), std::to_string(memMb)}).ok;
+        "  capacity=EXCLUDED.capacity, status='ACTIVE', last_heartbeat=now()",
+        {id, hostname, ip, std::to_string(cpuCores), std::to_string(memMb),
+         std::to_string(capacity)}).ok;
 }
 
-bool Database::recordHeartbeat(const std::string& id) {
-    return exec("UPDATE workers SET status='ACTIVE', last_heartbeat=now() WHERE worker_id=$1",
-                {id}).ok;
+bool Database::recordHeartbeat(const std::string& id, int running) {
+    return exec("UPDATE workers SET status='ACTIVE', last_heartbeat=now(), running_tasks=$2::int "
+                "WHERE worker_id=$1", {id, std::to_string(running)}).ok;
 }
 
-bool Database::recordResources(const std::string& id, double cpu, double ram, double disk) {
+bool Database::recordResources(const std::string& id, const ResourceRow& r) {
     // One statement: update the live row, then log the sample in resource_metrics.
     return exec(
         "WITH u AS ("
         "  UPDATE workers SET cpu_usage=$2::double precision, ram_usage=$3::double precision, "
-        "         disk_usage=$4::double precision, status='ACTIVE', last_heartbeat=now() "
+        "         disk_usage=$4::double precision, ram_available_mb=$5::bigint, running_tasks=$6::int, "
+        "         process_rss_mb=$7::double precision, load1=$8::double precision, "
+        "         storage_bytes=$9::bigint, busy_cores=$10, status='ACTIVE', last_heartbeat=now(), last_resource_at=now() "
         "  WHERE worker_id=$1 RETURNING worker_id) "
-        "INSERT INTO resource_metrics (worker_id, cpu_usage, ram_usage, disk_usage, status) "
-        "SELECT worker_id, $2::double precision, $3::double precision, $4::double precision, 'ACTIVE' FROM u",
-        {id, num(cpu), num(ram), num(disk)}).ok;
+        "INSERT INTO resource_metrics (worker_id, cpu_usage, ram_usage, disk_usage, status, "
+        "                              running_tasks, ram_available_mb) "
+        "SELECT worker_id, $2::double precision, $3::double precision, $4::double precision, 'ACTIVE', "
+        "       $6::int, $5::bigint FROM u",
+        {id, num(r.cpu), num(r.ram), num(r.disk), std::to_string(r.ramAvailMb),
+         std::to_string(r.running), num(r.rssMb), num(r.load1), std::to_string(r.storageBytes), r.cores}).ok;
 }
 
 bool Database::setWorkerStatus(const std::string& id, const std::string& status) {
     return exec("UPDATE workers SET status=$2 WHERE worker_id=$1", {id, status}).ok;
-}
-
-// --------------------------------------------------------- Jobs / tasks ----
-
-bool Database::createJobAndTask(const std::string& type, const std::string& params,
-                                long long& jobId, long long& taskId, std::string& err) {
-    Result j = exec("INSERT INTO jobs (job_type) VALUES ($1) RETURNING job_id", {type});
-    if (!j.ok || j.rows.empty()) { err = j.error; return false; }
-    jobId = std::stoll(j.rows[0][0]);
-
-    Result t = exec("INSERT INTO tasks (job_id, task_type, params) VALUES ($1::int, $2, $3) "
-                    "RETURNING task_id", {std::to_string(jobId), type, params});
-    if (!t.ok || t.rows.empty()) { err = t.error; return false; }
-    taskId = std::stoll(t.rows[0][0]);
-    return true;
-}
-
-bool Database::markTaskAssigned(long long taskId, const std::string& workerId) {
-    return exec("UPDATE tasks SET status='ASSIGNED', assigned_worker=$2, assigned_at=now() "
-                "WHERE task_id=$1::int", {std::to_string(taskId), workerId}).ok;
-}
-
-bool Database::markTaskStarted(long long taskId) {
-    bool a = exec("UPDATE tasks SET status='RUNNING', started_at=now() WHERE task_id=$1::int",
-                  {std::to_string(taskId)}).ok;
-    bool b = exec("UPDATE jobs SET status='RUNNING' WHERE job_id=(SELECT job_id FROM tasks WHERE task_id=$1::int)",
-                  {std::to_string(taskId)}).ok;
-    return a && b;
-}
-
-bool Database::markTaskCompleted(long long taskId, const std::string& result) {
-    bool a = exec("UPDATE tasks SET status='COMPLETED', completed_at=now(), result=$2 "
-                  "WHERE task_id=$1::int", {std::to_string(taskId), result}).ok;
-    bool b = exec("UPDATE jobs SET status='COMPLETED', completed_at=now() "
-                  "WHERE job_id=(SELECT job_id FROM tasks WHERE task_id=$1::int)",
-                  {std::to_string(taskId)}).ok;
-    return a && b;
-}
-
-bool Database::markTaskFailed(long long taskId, const std::string& reason) {
-    bool a = exec("UPDATE tasks SET status='FAILED', completed_at=now(), result=$2 "
-                  "WHERE task_id=$1::int", {std::to_string(taskId), reason}).ok;
-    bool b = exec("UPDATE jobs SET status='FAILED', completed_at=now() "
-                  "WHERE job_id=(SELECT job_id FROM tasks WHERE task_id=$1::int)",
-                  {std::to_string(taskId)}).ok;
-    return a && b;
-}
-
-bool Database::recordExecution(long long taskId, const std::string& workerId,
-                               const std::string& taskType, double execSeconds,
-                               const std::string& status, double cpuAtAssign,
-                               double ramAtAssign, const std::string& policy) {
-    return exec(
-        "INSERT INTO execution_history (task_id, worker_id, task_type, execution_time, status, "
-        "  worker_cpu_at_assign, worker_ram_at_assign, scheduler_policy) "
-        "VALUES ($1::int, $2, $3, $4::double precision, $5, $6::double precision, "
-        "        $7::double precision, $8)",
-        {std::to_string(taskId), workerId, taskType, num(execSeconds), status,
-         num(cpuAtAssign), num(ramAtAssign), policy}).ok;
 }
 
 }  // namespace nexus
