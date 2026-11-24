@@ -1,5 +1,6 @@
-
+// Message framing + TCP connection wrapper shared by Master and Worker.
 #pragma once
+
 #include <map>
 #include <memory>
 #include <mutex>
@@ -23,6 +24,7 @@ public:
     long long   getInt(const std::string& key, long long def = 0) const;
     double      getDouble(const std::string& key, double def = 0.0) const;
 
+    bool has(const std::string& key) const { return fields_.count(key) != 0; }
     const std::string& type() const { return type_; }
 
     std::string serialize() const;                       // includes trailing '\n'
@@ -57,10 +59,11 @@ public:
 private:
     int fd_;
     std::string rbuf_;
+    size_t scanPos_ = 0;       // where the next '\n' search starts
     std::mutex sendMutex_;
 };
 
 // Server side: socket() + bind() + listen(). Returns listening fd or -1.
-int createListener(int port, std::string& err);
+int createListener(int port, std::string& err, const std::string& bindAddr = "0.0.0.0");
 
 }  // namespace nexus

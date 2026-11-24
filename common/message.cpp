@@ -1,6 +1,7 @@
 #include "message.h"
 
 #include <arpa/inet.h>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -13,14 +14,18 @@
 #include <unistd.h>
 
 #ifndef MSG_NOSIGNAL
-#define MSG_NOSIGNAL 0   
+#define MSG_NOSIGNAL 0   // main() also ignores SIGPIPE
 #endif
 
 namespace nexus {
 
 namespace {
 
-constexpr size_t kMaxLine = 64 *1024; 
+// Block transfers carry base64 block data in one line, so the cap is generous
+// (blocks are limited to 4 MiB => ~5.6 MB of base64). Still bounded against a runaway peer.
+constexpr size_t kMaxLine = 24 * 1024 * 1024;
+
+bool isHex(char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; }
 
 std::string escape(const std::string& s) {
     std::string out;
@@ -39,7 +44,7 @@ std::string escape(const std::string& s) {
 std::string unescape(const std::string& s) {
     std::string out;
     for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '%' && i + 2 < s.size()) {
+        if (s[i] == '%' && i + 2 < s.size() && isHex(s[i + 1]) && isHex(s[i + 2])) {
             out += static_cast<char>(std::stoi(s.substr(i + 1, 2), nullptr, 16));
             i += 2;
         } else {
@@ -49,7 +54,9 @@ std::string unescape(const std::string& s) {
     return out;
 }
 
-}  
+}  // namespace
+
+// ---------------------------------------------------------------- Message --
 
 Message& Message::set(const std::string& k, const std::string& v) {
     fields_[k] = v;
@@ -138,13 +145,17 @@ bool Connection::send(const Message& m) {
 
 int Connection::receive(Message& out, int timeoutMs) {
     for (;;) {
-        size_t nl = rbuf_.find('\n');
+        // TCP is a byte stream: one recv() may hold half a message or several.
+        // So we buffer and cut complete lines.
+        size_t nl = rbuf_.find('\n', scanPos_);
         if (nl != std::string::npos) {
             std::string line = rbuf_.substr(0, nl);
             rbuf_.erase(0, nl + 1);
+            scanPos_ = 0;
             if (Message::parse(line, out)) return 1;
             continue;   // skip malformed / empty lines
         }
+        scanPos_ = rbuf_.size();          // don't rescan bytes we already searched
         if (rbuf_.size() > kMaxLine) return -1;
 
         pollfd p;
@@ -153,7 +164,7 @@ int Connection::receive(Message& out, int timeoutMs) {
         if (r == 0) return 0;
         if (r < 0) return errno == EINTR ? 0 : -1;
 
-        char tmp[4096];
+        char tmp[65536];
         ssize_t n = ::recv(fd_, tmp, sizeof tmp, 0);
         if (n == 0) return -1;                       // orderly close by peer
         if (n < 0) return (errno == EINTR || errno == EAGAIN) ? 0 : -1;
@@ -173,7 +184,8 @@ std::string Connection::peerAddress() const {
     return buf;
 }
 
-std::shared_ptr<Connection> Connection::connectTo(const std::string& host, int port,std::string& err) {
+std::shared_ptr<Connection> Connection::connectTo(const std::string& host, int port,
+                                                  std::string& err) {
     addrinfo hints;
     std::memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -196,7 +208,7 @@ std::shared_ptr<Connection> Connection::connectTo(const std::string& host, int p
     return std::make_shared<Connection>(fd);
 }
 
-int createListener(int port, std::string& err) {
+int createListener(int port, std::string& err, const std::string& bindAddr) {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) { err = std::strerror(errno); return -1; }
 
@@ -206,7 +218,11 @@ int createListener(int port, std::string& err) {
     sockaddr_in addr;
     std::memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (inet_pton(AF_INET, bindAddr.c_str(), &addr.sin_addr) != 1) {
+        err = "invalid bind address '" + bindAddr + "' (use an IPv4 address such as 0.0.0.0 or 127.0.0.1)";
+        ::close(fd);
+        return -1;
+    }
     addr.sin_port = htons(static_cast<uint16_t>(port));
 
     if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 ||
